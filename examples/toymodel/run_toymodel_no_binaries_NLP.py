@@ -1,12 +1,31 @@
+from math import log
+
 from pyomo.core import ConcreteModel, exp
 from pyomo.core import log as ln
-from pyomo.environ import Constraint, Objective, Reals, Var, maximize  # noqa: F401
+from pyomo.environ import (  # noqa: F401
+    Constraint,
+    NonNegativeReals,
+    Objective,
+    Reals,
+    Var,
+    maximize,
+)
 
+from cobrak.constants import (
+    DF_VAR_PREFIX,
+    ENZYME_VAR_INFIX,
+    ENZYME_VAR_PREFIX,
+    GAMMA_VAR_PREFIX,
+    KAPPA_VAR_PREFIX,
+    LNCONC_VAR_PREFIX,
+    MDF_VAR_ID,
+)
+from cobrak.dataclasses import ExtraLinearConstraint
 from cobrak.example_models import toy_model
 from cobrak.pyomo_functionality import get_solver
 from cobrak.standard_solvers import SCIP
 
-QUASI_INF = 1e6
+QUASI_INF = 1e4
 
 
 def create_stoichiometric_matrix(_toy_model) -> dict[str, dict[str, float]]:
@@ -77,11 +96,11 @@ def create_base_model(_toy_model) -> ConcreteModel:
 
     def reaction_flux_bounds(_m, rxn_id):
         reaction = reactions[rxn_id]
-        return (reaction.min_flux, reaction.max_flux)
+        return (0, reaction.max_flux)
 
     model.reaction_fluxes = Var(
         reactions.keys(),
-        domain=Reals,
+        domain=NonNegativeReals,
         bounds=reaction_flux_bounds,
     )
 
@@ -116,22 +135,22 @@ def create_base_model(_toy_model) -> ConcreteModel:
     )
     model.reactions_kappa = Var(
         reactions.keys(),
-        domain=Reals,
+        domain=NonNegativeReals,
         bounds=(0.0, 1.0),
     )
     model.reactions_driving_force = Var(
         reactions.keys(),
         domain=Reals,
-        bounds=(-QUASI_INF, QUASI_INF),
+        bounds=(-1.0, QUASI_INF),
     )
     model.reactions_gamma = Var(
         reactions.keys(),
-        domain=Reals,
+        domain=NonNegativeReals,
         bounds=(0.0, 1.0),
     )
 
     # Scalar MDF variable that can be optimized.
-    model.B = Var(domain=Reals, bounds=(-QUASI_INF, QUASI_INF))
+    model.B = Var(domain=Reals, bounds=(0, QUASI_INF))
 
     return model
 
@@ -349,8 +368,67 @@ def set_min_driving_force_gamma_constraints(
     return opt_model
 
 
+def _resolve_extra_linear_constraint_var(model, _toy_model, var_id: str):
+    if var_id in _toy_model.reactions:
+        return model.reaction_fluxes[var_id]
+    if var_id.startswith(LNCONC_VAR_PREFIX):
+        met_id = var_id[len(LNCONC_VAR_PREFIX) :]
+        if met_id in _toy_model.metabolites:
+            return model.metabolite_log_concentrations[met_id]
+    if var_id.startswith(KAPPA_VAR_PREFIX):
+        rxn_id = var_id[len(KAPPA_VAR_PREFIX) :]
+        if rxn_id in _toy_model.reactions:
+            return model.reactions_kappa[rxn_id]
+    if var_id.startswith(GAMMA_VAR_PREFIX):
+        rxn_id = var_id[len(GAMMA_VAR_PREFIX) :]
+        if rxn_id in _toy_model.reactions:
+            return model.reactions_gamma[rxn_id]
+    if var_id.startswith(DF_VAR_PREFIX):
+        rxn_id = var_id[len(DF_VAR_PREFIX) :]
+        if rxn_id in _toy_model.reactions:
+            return model.reactions_driving_force[rxn_id]
+    if var_id.startswith(ENZYME_VAR_PREFIX) and ENZYME_VAR_INFIX in var_id:
+        rxn_id = var_id.split(ENZYME_VAR_INFIX, 1)[1]
+        if rxn_id in _toy_model.reactions:
+            return model.enzyme_reaction_concentrations[rxn_id]
+    if var_id in {"B", MDF_VAR_ID}:
+        return model.B
+    return None
+
+
+def add_extra_linear_constraints(opt_model: ConcreteModel, _toy_model) -> ConcreteModel:
+    for constraint_i, extra_linear_constraint in enumerate(
+        getattr(_toy_model, "extra_linear_constraints", [])
+    ):
+        lhs = 0.0
+        missing_var = False
+        for var_id, coefficient in extra_linear_constraint.stoichiometries.items():
+            resolved_var = _resolve_extra_linear_constraint_var(opt_model, _toy_model, var_id)
+            if resolved_var is None:
+                missing_var = True
+                break
+            lhs += coefficient * resolved_var
+
+        if missing_var:
+            continue
+
+        if extra_linear_constraint.lower_value is not None:
+            setattr(
+                opt_model,
+                f"extra_linear_constraint_{constraint_i}_lb",
+                Constraint(expr=lhs >= extra_linear_constraint.lower_value),
+            )
+        if extra_linear_constraint.upper_value is not None:
+            setattr(
+                opt_model,
+                f"extra_linear_constraint_{constraint_i}_ub",
+                Constraint(expr=lhs <= extra_linear_constraint.upper_value),
+            )
+    return opt_model
+
+
 def build_NLP_without_binary_constraints(_toy_model):
-    TOTAL_METABOLITE_CONCENTRATION = 1.0
+    TOTAL_METABOLITE_CONCENTRATION = 0.4
     TOTAL_ENZYME_CONCENTRATION = _toy_model.max_prot_pool
     MIN_DRIVING_FORCE = 1e-3
     EPSILON_KAPPA = 1e-4
@@ -368,6 +446,7 @@ def build_NLP_without_binary_constraints(_toy_model):
         TOTAL_METABOLITE_CONCENTRATION,
     )
     model = set_min_driving_force_gamma_constraints(model, _toy_model, MIN_DRIVING_FORCE)
+    model = add_extra_linear_constraints(model, _toy_model)
     return model
 
 
@@ -395,6 +474,16 @@ def parse_minimal_results(
 
 
 if __name__ == "__main__":
+    toy_model.extra_linear_constraints = [
+        ExtraLinearConstraint(
+            stoichiometries={
+                "x_ATP": 1.0,
+                "x_ADP": -1.0,
+            },
+            lower_value=log(3.0),
+        )
+    ]
+
     m = build_NLP_without_binary_constraints(toy_model)
     m.obj = Objective(expr=m.reaction_fluxes["ATP_Consumption"], sense=maximize)
 
